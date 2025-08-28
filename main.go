@@ -21,6 +21,8 @@ var (
 	refreshSecret = "super-secret-refresh-key"
 	accessTTL     = 15 * time.Minute
 	refreshTTL    = 7 * 24 * time.Hour
+	phoneRegex    = `^09\d{9}$`
+	otpLength     = 6
 	ctx           = context.Background()
 )
 
@@ -42,6 +44,8 @@ func main() {
 		AccessTokenTTL:     accessTTL,
 		RefreshTokenSecret: refreshSecret,
 		RefreshTokenTTL:    refreshTTL,
+		PhoneRegex:         phoneRegex,
+		OTPLength:          otpLength,
 	}
 	authSvc := authService.New(authConfig, authCache)
 	authHandler := authHttp.New(authSvc)
@@ -67,7 +71,7 @@ func main() {
 		}
 	})
 
-	r.Mount("/auth", authHandler.Routes())
+	r.Mount("/auth", authHandler.Routes(rdAdapter.Client()))
 
 	err := http.ListenAndServe(":8080", r)
 	if err != nil {

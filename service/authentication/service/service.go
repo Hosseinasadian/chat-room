@@ -1,10 +1,12 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/hosseinasadian/chat-application/pkg/ratelimiter"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"math/rand/v2"
@@ -16,20 +18,26 @@ import (
 )
 
 type Service struct {
-	Cache  repository.Cache
-	Config Config
+	config    Config
+	otpRepo   repository.OTP
+	validator Validator
 }
 
-func New(config Config, cache repository.Cache) Service {
-	return Service{Cache: cache, Config: config}
+func New(config Config, otpRepo repository.OTP) Service {
+	validator := newValidator(config.OTPLength, config.PhoneRegex)
+	return Service{otpRepo: otpRepo, config: config, validator: validator}
 }
 
 func (s Service) SendOtp(req SendOtpRequest) (SendOtpResponse, error) {
 	const op = "authentication.service.SendOtp"
 
+	if vErr := s.validator.validateSendOtp(req); vErr != nil {
+		return SendOtpResponse{}, richerror.New(op).WithKind(richerror.KindInvalid).WithMessage(vErr.Error())
+	}
+
 	otp := fmt.Sprintf("%06d", rand.IntN(1000000))
 
-	redisAdapter := s.Cache.Adapter()
+	redisAdapter := s.otpRepo.Adapter()
 	if rsErr := redisAdapter.Client().Set(redisAdapter.Context(), "otp:"+req.Phone, otp, 5*time.Minute).Err(); rsErr != nil {
 		return SendOtpResponse{}, richerror.New(op).WithWrapper(rsErr)
 	}
@@ -43,30 +51,29 @@ func (s Service) SendOtp(req SendOtpRequest) (SendOtpResponse, error) {
 func (s Service) VerifyOtp(req VerifyOtpRequest) (VerifyOtpResponse, error) {
 	const op = "authentication.service.VerifyOtp"
 
-	redisAdapter := s.Cache.Adapter()
+	if vErr := s.validator.validateVerifyOtp(req); vErr != nil {
+		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindInvalid).WithMessage(vErr.Error())
+	}
+
+	redisAdapter := s.otpRepo.Adapter()
 
 	attemptKey := "otp_attempts:" + req.Phone
-	attempts, _ := redisAdapter.Client().Get(redisAdapter.Context(), attemptKey).Int()
-	if attempts >= 5 { // Max 5 attempts
-		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindTooManyRequests).WithMessage("Too many failed attempts. Please request a new OTP")
-	}
-
-	// Validate OTP format (should be 6 digits)
-	if len(req.Otp) != 6 {
-		s.incrementFailedAttempts(req.Phone)
-		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindBadRequest).WithMessage("OTP must be 6 digits")
-	}
+	verifyOtpLimiter := ratelimiter.New(redisAdapter.Client(), 5, 15*time.Minute)
 
 	stored, err := redisAdapter.Client().Get(redisAdapter.Context(), "otp:"+req.Phone).Result()
 	if errors.Is(err, redis.Nil) {
-		s.incrementFailedAttempts(req.Phone)
+		if atErr := s.incrementFailedAttempts(verifyOtpLimiter, redisAdapter.Context(), attemptKey); atErr != nil {
+			return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindTooManyRequests).WithMessage("Too many failed attempts. Please request a new OTP")
+		}
 		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindGone).WithMessage("OTP has expired")
 	} else if err != nil {
 		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindUnexpected).WithMessage(http.StatusText(http.StatusInternalServerError))
 	}
 
 	if stored != req.Otp {
-		s.incrementFailedAttempts(req.Phone)
+		if atErr := s.incrementFailedAttempts(verifyOtpLimiter, redisAdapter.Context(), attemptKey); atErr != nil {
+			return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindTooManyRequests).WithMessage("Too many failed attempts. Please request a new OTP")
+		}
 		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindInvalid).WithMessage("Invalid OTP code")
 	}
 
@@ -98,7 +105,7 @@ func (s Service) VerifyOtp(req VerifyOtpRequest) (VerifyOtpResponse, error) {
 	_ = redisAdapter.Client().Del(redisAdapter.Context(), "otp:"+req.Phone).Err()
 
 	// Optional: store meta
-	_ = redisAdapter.Client().Set(redisAdapter.Context(), "refresh-meta:"+jti, fmt.Sprintf(`{"phone":"%s","deviceId":"%s"}`, req.Phone, deviceID), s.Config.AccessTokenTTL).Err()
+	_ = redisAdapter.Client().Set(redisAdapter.Context(), "refresh-meta:"+jti, fmt.Sprintf(`{"phone":"%s","deviceId":"%s"}`, req.Phone, deviceID), s.config.AccessTokenTTL).Err()
 
 	return VerifyOtpResponse{AccessToken: access, RefreshToken: refresh, DeviceID: deviceID}, nil
 
@@ -106,10 +113,15 @@ func (s Service) VerifyOtp(req VerifyOtpRequest) (VerifyOtpResponse, error) {
 
 func (s Service) RefreshToken(req RefreshRequest) (RefreshResponse, error) {
 	const op = "authentication.service.RefreshToken"
-	redisAdapter := s.Cache.Adapter()
+
+	if vErr := s.validator.validateRefreshToken(req); vErr != nil {
+		return RefreshResponse{}, richerror.New(op).WithKind(richerror.KindInvalid).WithMessage(vErr.Error())
+	}
+
+	redisAdapter := s.otpRepo.Adapter()
 
 	token, err := jwt.Parse(req.RefreshToken, func(t *jwt.Token) (interface{}, error) {
-		return s.Config.AccessTokenSecret, nil
+		return []byte(s.config.AccessTokenSecret), nil
 	})
 	if err != nil || !token.Valid {
 		return RefreshResponse{}, richerror.New(op).WithKind(richerror.KindUnauthorized).WithMessage("Invalid refresh token")
@@ -168,7 +180,7 @@ func (s Service) RefreshToken(req RefreshRequest) (RefreshResponse, error) {
 	}
 
 	// Optional: store new meta
-	_ = redisAdapter.Client().Set(redisAdapter.Context(), "refresh-meta:"+newJTI, fmt.Sprintf(`{"phone":"%s","deviceId":"%s"}`, phone, deviceID), s.Config.RefreshTokenTTL).Err()
+	_ = redisAdapter.Client().Set(redisAdapter.Context(), "refresh-meta:"+newJTI, fmt.Sprintf(`{"phone":"%s","deviceId":"%s"}`, phone, deviceID), s.config.RefreshTokenTTL).Err()
 
 	return RefreshResponse{AccessToken: access, RefreshToken: newRefresh, DeviceID: deviceID}, nil
 }
@@ -214,15 +226,6 @@ func (s Service) Logout(req LogoutRequest) (LogoutResponse, error) {
 
 }
 
-func (s Service) incrementFailedAttempts(phone string) {
-	redisAdapter := s.Cache.Adapter()
-
-	attemptKey := "otp_attempts:" + phone
-	pipe := redisAdapter.Client().Pipeline()
-	pipe.Incr(redisAdapter.Context(), attemptKey)
-	pipe.Expire(redisAdapter.Context(), attemptKey, 15*time.Minute) // Reset after 15 minutes
-	_, err := pipe.Exec(redisAdapter.Context())
-	if err != nil {
-		return
-	}
+func (s Service) incrementFailedAttempts(verifyOtpLimiter *ratelimiter.RateLimiter, ctx context.Context, attemptKey string) error {
+	return verifyOtpLimiter.Allow(ctx, attemptKey)
 }
