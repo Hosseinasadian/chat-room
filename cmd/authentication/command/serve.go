@@ -72,6 +72,7 @@ func serve() {
 
 	svc := authentication.Setup(logger, *cfg, server)
 	svc.Start()
+
 }
 
 func init() {
