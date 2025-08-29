@@ -1,0 +1,10 @@
+.DS_Store
+.idea
+
+vendor
+temp
+*.log
+
+.env
+.vscode/
+**/__debug*
