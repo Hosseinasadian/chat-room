@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"github.com/go-chi/httprate"
 	"github.com/hosseinasadian/chat-application/pkg/httpmsg"
 	"github.com/hosseinasadian/chat-application/pkg/httpresponse"
 	"github.com/hosseinasadian/chat-application/service/authentication/service"
@@ -10,12 +11,14 @@ import (
 )
 
 type Handler struct {
-	AuthSvc service.Service
+	AuthSvc          service.Service
+	LoginRateLimiter *httprate.RateLimiter
 }
 
-func New(authSvc service.Service) Handler {
+func New(authSvc service.Service, loginRateLimiter *httprate.RateLimiter) Handler {
 	return Handler{
-		AuthSvc: authSvc,
+		AuthSvc:          authSvc,
+		LoginRateLimiter: loginRateLimiter,
 	}
 }
 
@@ -60,6 +63,15 @@ func (h Handler) VerifyOtpHandler(w http.ResponseWriter, r *http.Request) {
 
 	res, vErr := h.AuthSvc.VerifyOtp(req)
 	if vErr != nil {
+		if h.LoginRateLimiter.OnLimit(w, r, "otp_attempts:"+req.Phone) {
+			httpresponse.SetJsonContentType(w)
+			httpresponse.SetStatus(w, http.StatusTooManyRequests)
+			httpresponse.SetMessage(w, map[string]string{
+				"error": "Too many attempts",
+			})
+			return
+		}
+
 		msg, code := httpmsg.Error(vErr)
 		httpresponse.SetJsonContentType(w)
 		httpresponse.SetStatus(w, code)

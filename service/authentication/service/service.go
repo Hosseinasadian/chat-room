@@ -1,12 +1,11 @@
 package service
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"github.com/hosseinasadian/chat-application/pkg/ratelimiter"
+	"github.com/hosseinasadian/chat-application/pkg/constant"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"math/rand/v2"
@@ -24,7 +23,7 @@ type Service struct {
 }
 
 func New(config Config, otpRepo repository.OTP) Service {
-	validator := newValidator(config.OTPLength, config.PhoneRegex)
+	validator := newValidator(config.OTPLength, constant.PhoneRegex)
 	return Service{otpRepo: otpRepo, config: config, validator: validator}
 }
 
@@ -57,28 +56,16 @@ func (s Service) VerifyOtp(req VerifyOtpRequest) (VerifyOtpResponse, error) {
 
 	redisAdapter := s.otpRepo.Adapter()
 
-	attemptKey := "otp_attempts:" + req.Phone
-	verifyOtpLimiter := ratelimiter.New(redisAdapter.Client(), 5, 15*time.Minute)
-
 	stored, err := redisAdapter.Client().Get(redisAdapter.Context(), "otp:"+req.Phone).Result()
 	if errors.Is(err, redis.Nil) {
-		if atErr := s.incrementFailedAttempts(verifyOtpLimiter, redisAdapter.Context(), attemptKey); atErr != nil {
-			return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindTooManyRequests).WithMessage("Too many failed attempts. Please request a new OTP")
-		}
 		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindGone).WithMessage("OTP has expired")
 	} else if err != nil {
 		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindUnexpected).WithMessage(http.StatusText(http.StatusInternalServerError))
 	}
 
 	if stored != req.Otp {
-		if atErr := s.incrementFailedAttempts(verifyOtpLimiter, redisAdapter.Context(), attemptKey); atErr != nil {
-			return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindTooManyRequests).WithMessage("Too many failed attempts. Please request a new OTP")
-		}
 		return VerifyOtpResponse{}, richerror.New(op).WithKind(richerror.KindInvalid).WithMessage("Invalid OTP code")
 	}
-
-	// Clear failed attempts on success
-	_ = redisAdapter.Client().Del(redisAdapter.Context(), attemptKey).Err()
 
 	// assign or accept deviceId
 	deviceID := req.DeviceID
@@ -224,8 +211,4 @@ func (s Service) Logout(req LogoutRequest) (LogoutResponse, error) {
 		Message: "Logged out successfully",
 	}, nil
 
-}
-
-func (s Service) incrementFailedAttempts(verifyOtpLimiter *ratelimiter.RateLimiter, ctx context.Context, attemptKey string) error {
-	return verifyOtpLimiter.Allow(ctx, attemptKey)
 }

@@ -2,18 +2,15 @@ package http
 
 import (
 	"github.com/go-chi/chi/v5"
-	"github.com/hosseinasadian/chat-application/pkg/ratelimiter"
-	"github.com/redis/go-redis/v9"
+	"github.com/go-chi/httprate"
 	"time"
 )
 
-func (h Handler) Routes(client *redis.Client) chi.Router {
+func (h Handler) Routes() chi.Router {
 	r := chi.NewRouter()
 
 	r.Group(func(r chi.Router) {
-		privateRateLimiter := ratelimiter.New(client, 10, time.Minute)
-		privateRateLimitMiddleware := ratelimiter.RateLimitMiddleware(*privateRateLimiter, "authenticatePrivate")
-		r.Use(privateRateLimitMiddleware)
+		r.Use(httprate.LimitByIP(10, time.Minute))
 
 		r.Post("/send-otp", h.SendOtpHandler)
 		r.Post("/verify-otp", h.VerifyOtpHandler)

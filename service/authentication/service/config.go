@@ -8,5 +8,4 @@ type Config struct {
 	RefreshTokenSecret string        `koanf:"refresh_token_secret"`
 	RefreshTokenTTL    time.Duration `koanf:"refresh_token_ttl"`
 	OTPLength          int           `koanf:"otp_length"`
-	PhoneRegex         string        `koanf:"phone_regex"`
 }
