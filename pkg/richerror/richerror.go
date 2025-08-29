@@ -15,8 +15,6 @@ const (
 
 type Operation string
 
-const ()
-
 type RichError struct {
 	operation Operation
 	wrapper   error
