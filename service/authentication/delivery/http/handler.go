@@ -3,23 +3,22 @@ package http
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"strings"
-
+	"github.com/go-chi/httprate"
 	"github.com/hosseinasadian/chat-application/pkg/httpmsg"
 	"github.com/hosseinasadian/chat-application/pkg/httpresponse"
 	"github.com/hosseinasadian/chat-application/service/authentication/service"
-
-	"github.com/golang-jwt/jwt/v5"
+	"net/http"
 )
 
 type Handler struct {
-	AuthSvc service.Service
+	AuthSvc          service.Service
+	LoginRateLimiter *httprate.RateLimiter
 }
 
-func New(authSvc service.Service) Handler {
+func New(authSvc service.Service, loginRateLimiter *httprate.RateLimiter) Handler {
 	return Handler{
-		AuthSvc: authSvc,
+		AuthSvc:          authSvc,
+		LoginRateLimiter: loginRateLimiter,
 	}
 }
 
@@ -64,6 +63,15 @@ func (h Handler) VerifyOtpHandler(w http.ResponseWriter, r *http.Request) {
 
 	res, vErr := h.AuthSvc.VerifyOtp(req)
 	if vErr != nil {
+		if h.LoginRateLimiter.OnLimit(w, r, "otp_attempts:"+req.Phone) {
+			httpresponse.SetJsonContentType(w)
+			httpresponse.SetStatus(w, http.StatusTooManyRequests)
+			httpresponse.SetMessage(w, map[string]string{
+				"error": "Too many attempts",
+			})
+			return
+		}
+
 		msg, code := httpmsg.Error(vErr)
 		httpresponse.SetJsonContentType(w)
 		httpresponse.SetStatus(w, code)
@@ -142,44 +150,16 @@ func (h Handler) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 func (h Handler) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			httpresponse.SetStatus(w, http.StatusUnauthorized)
+		claims, pErr := h.AuthSvc.ParseToken(authHeader)
+		if pErr != nil {
+			msg, code := httpmsg.Error(pErr)
+			httpresponse.SetStatus(w, code)
 			httpresponse.SetMessage(w, map[string]string{
-				"error": "Missing token",
+				"error": msg,
 			})
 			return
 		}
-
-		// Expect format: "Bearer <token>"
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-		if tokenString == authHeader {
-			httpresponse.SetStatus(w, http.StatusUnauthorized)
-			httpresponse.SetMessage(w, map[string]string{
-				"error": "Invalid token format",
-			})
-			return
-		}
-
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			return []byte(h.AuthSvc.Config.AccessTokenSecret), nil
-		})
-		if err != nil || !token.Valid {
-			httpresponse.SetStatus(w, http.StatusUnauthorized)
-			httpresponse.SetMessage(w, map[string]string{
-				"error": "Invalid token",
-			})
-			return
-		}
-
-		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			ctx := context.WithValue(r.Context(), "claims", claims)
-			next.ServeHTTP(w, r.WithContext(ctx))
-			return
-		}
-
-		httpresponse.SetStatus(w, http.StatusUnauthorized)
-		httpresponse.SetMessage(w, map[string]string{
-			"error": "Invalid claims",
-		})
+		ctx := context.WithValue(r.Context(), "claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
